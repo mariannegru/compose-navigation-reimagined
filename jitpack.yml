@@ -1,0 +1,21 @@
+jdk:
+  - openjdk17
+
+# JitPack runs `./gradlew install` by default, which doesn't exist here because
+# publishing is configured through the `maven-publish` plugin inside
+# `buildSrc/src/main/kotlin/publishing-config.gradle.kts`.
+# Publish only the artifacts consumers will depend on (skip samples/test-utils).
+# Signing is skipped automatically via the `isMavenLocalPublish` guard in
+# publishing-config.gradle.kts — JitPack has no PGP key.
+install:
+  - ./gradlew
+      :reimagined:publishToMavenLocal
+      :reimagined-material-common:publishToMavenLocal
+      :reimagined-material:publishToMavenLocal
+      :reimagined-material3:publishToMavenLocal
+      :reimagined-hilt:publishToMavenLocal
+      -x signReimaginedPublication
+      -x signReimaginedMaterialCommonPublication
+      -x signReimaginedMaterialPublication
+      -x signReimaginedMaterial3Publication
+      -x signReimaginedHiltPublication

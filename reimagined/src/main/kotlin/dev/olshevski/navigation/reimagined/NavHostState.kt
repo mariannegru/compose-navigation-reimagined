@@ -232,18 +232,32 @@ internal class NavHostStateImpl<T, S>(
         }
     }
 
-    fun createSnapshot() = NavSnapshot(
-        items = backstack.entries.map { entry ->
-            NavSnapshotItem(
-                hostEntry = getOrCreateNewHostEntry(entry),
-                scopedHostEntries = scopeSpec.getScopes(entry.destination)
-                    .associateWith { scope ->
-                        getOrCreateNewScopedHostEntry(id = NavId(), scope = scope)
-                    }
-            )
-        },
-        action = backstack.action
-    ).also { snapshot ->
+    // Cache the last-returned snapshot keyed by the backstack reference. Compose's
+    // `derivedStateOf { createSnapshot() }` can re-invoke this function even when the
+    // backstack itself hasn't changed (e.g., when an unrelated observable read inside
+    // NavSnapshot construction — like a destination property — reports a change).
+    // Returning a fresh NavSnapshot each time bloats Compose's state-record history,
+    // retaining NavSnapshotItems and their NavHostEntries across many GC cycles.
+    private var cachedSnapshotBackstack: NavBackstack<T>? = null
+    private var cachedSnapshot: NavSnapshot<T, S>? = null
+
+    fun createSnapshot(): NavSnapshot<T, S> {
+        val currentBackstack = backstack
+        cachedSnapshot?.let { existing ->
+            if (cachedSnapshotBackstack === currentBackstack) return existing
+        }
+        val snapshot = NavSnapshot(
+            items = currentBackstack.entries.map { entry ->
+                NavSnapshotItem(
+                    hostEntry = getOrCreateNewHostEntry(entry),
+                    scopedHostEntries = scopeSpec.getScopes(entry.destination)
+                        .associateWith { scope ->
+                            getOrCreateNewScopedHostEntry(id = NavId(), scope = scope)
+                        }
+                )
+            },
+            action = currentBackstack.action
+        )
         val backstackEntryIds = snapshot.items.mapTo(hashSetOf()) { it.hostEntry.id }
         val outdatedHostEntries = hostEntriesMap.keys
             .filter { it !in backstackEntryIds }
@@ -255,12 +269,20 @@ internal class NavHostStateImpl<T, S>(
             .filter { it !in backstackEntryScopes }
             .mapNotNull { scopedHostEntriesMap.remove(it) }
 
-        outdatedHostEntriesQueue.addLast(
-            OutdatedHostEntriesQueueItem(
-                snapshot = snapshot,
-                outdatedHostEntries = outdatedHostEntries + outdatedScopedHostEntries
+        // Only queue if there is actual cleanup to do — otherwise we accumulate
+        // empty queue items that only serve to pin the NavSnapshot in memory.
+        val allOutdated = outdatedHostEntries + outdatedScopedHostEntries
+        if (allOutdated.isNotEmpty()) {
+            outdatedHostEntriesQueue.addLast(
+                OutdatedHostEntriesQueueItem(
+                    snapshot = snapshot,
+                    outdatedHostEntries = allOutdated
+                )
             )
-        )
+        }
+        cachedSnapshotBackstack = currentBackstack
+        cachedSnapshot = snapshot
+        return snapshot
     }
 
     private fun getAllHostEntries() = listOf(
@@ -350,6 +372,15 @@ internal class NavHostStateImpl<T, S>(
 
     /**
      * Remove entries that are no longer in the snapshot.
+     *
+     * Cleanup strategy:
+     *  1. If the passed snapshot is found in the queue (referential equality), drain up to and
+     *     including it — matching upstream behaviour for in-flight transitions.
+     *  2. Otherwise (the common cause of the NavHostEntry leak: `derivedStateOf { createSnapshot() }`
+     *     produces spurious snapshots that are appended to the queue but never become a transition
+     *     target), treat it as "transition is settled for visible items": drop every queued item
+     *     whose outdated entries are not referenced by the current backstack. This reclaims entries
+     *     that would otherwise accumulate forever.
      */
     fun removeOutdatedHostEntries(snapshot: NavSnapshot<T, S>) {
         if (outdatedHostEntriesQueue.any { it.snapshot == snapshot }) {
@@ -360,6 +391,23 @@ internal class NavHostStateImpl<T, S>(
                     removeComponents(entry.id)
                 }
             } while (item.snapshot != snapshot)
+            return
+        }
+        // Fallback: drain any queued item whose entries are all absent from the current backstack.
+        // Keeps in-flight transition entries alive (they'll be in the current backstack or
+        // scopes) while reclaiming truly orphaned entries.
+        val backstackEntryIds = backstack.entries.mapTo(hashSetOf()) { it.id }
+        val iterator = outdatedHostEntriesQueue.iterator()
+        while (iterator.hasNext()) {
+            val item = iterator.next()
+            val allTrulyOutdated = item.outdatedHostEntries.all { it.id !in backstackEntryIds }
+            if (allTrulyOutdated) {
+                iterator.remove()
+                item.outdatedHostEntries.forEach { entry ->
+                    entry.maxLifecycleState = Lifecycle.State.DESTROYED
+                    removeComponents(entry.id)
+                }
+            }
         }
     }
 

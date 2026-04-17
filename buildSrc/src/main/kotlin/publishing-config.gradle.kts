@@ -57,10 +57,14 @@ afterEvaluate {
     }
 }
 
-signing {
-    useInMemoryPgpKeys(
-        project.properties["signing.key"].toString(),
-        project.properties["signing.password"].toString(),
-    )
-    sign(publishing.publications)
+// Skip signing for mavenLocal publishes (no PGP key needed for local testing).
+val isMavenLocalPublish = gradle.startParameter.taskNames.any { it.contains("MavenLocal") }
+if (!isMavenLocalPublish) {
+    signing {
+        useInMemoryPgpKeys(
+            project.properties["signing.key"].toString(),
+            project.properties["signing.password"].toString(),
+        )
+        sign(publishing.publications)
+    }
 }

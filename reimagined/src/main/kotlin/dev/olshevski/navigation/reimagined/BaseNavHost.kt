@@ -105,6 +105,12 @@ fun <T, S> BaseNavHost(
         DisposableEffect(currentVisibleItems) {
             if (currentVisibleItems == targetVisibleItems) {
                 state.onTransitionFinish(currentVisibleItems)
+                // Aggressively reclaim any outdated entries queued by createSnapshot
+                // that the currentSnapshot-based cleanup below would miss (e.g. snapshots
+                // added by derivedStateOf recomputations that never became a transition
+                // target). latestSnapshot is always the most recently queued snapshot,
+                // so calling with it drains the queue.
+                state.removeOutdatedHostEntries(latestSnapshot)
             }
             onDispose {}
         }
