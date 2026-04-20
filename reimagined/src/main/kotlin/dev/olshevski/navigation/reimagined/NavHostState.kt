@@ -27,6 +27,7 @@ import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import androidx.savedstate.SavedStateRegistry
 import kotlinx.parcelize.Parcelize
+import java.lang.ref.WeakReference
 
 /**
  * Remembers [NavHostState]. This allows you to hoist the state of NavHost and
@@ -232,18 +233,17 @@ internal class NavHostStateImpl<T, S>(
         }
     }
 
-    // Cache the last-returned snapshot keyed by the backstack reference. Compose's
-    // `derivedStateOf { createSnapshot() }` can re-invoke this function even when the
-    // backstack itself hasn't changed (e.g., when an unrelated observable read inside
-    // NavSnapshot construction — like a destination property — reports a change).
-    // Returning a fresh NavSnapshot each time bloats Compose's state-record history,
-    // retaining NavSnapshotItems and their NavHostEntries across many GC cycles.
+
+    // Cache the last-returned snapshot keyed by the backstack reference. Held via a
+    // WeakReference so the cache only speeds up consecutive reads for the same
+    // backstack without extending the lifetime of the snapshot or its items beyond
+    // what Compose's normal retention mandates.
     private var cachedSnapshotBackstack: NavBackstack<T>? = null
-    private var cachedSnapshot: NavSnapshot<T, S>? = null
+    private var cachedSnapshot: WeakReference<NavSnapshot<T, S>>? = null
 
     fun createSnapshot(): NavSnapshot<T, S> {
         val currentBackstack = backstack
-        cachedSnapshot?.let { existing ->
+        cachedSnapshot?.get()?.let { existing ->
             if (cachedSnapshotBackstack === currentBackstack) return existing
         }
         val snapshot = NavSnapshot(
@@ -281,7 +281,7 @@ internal class NavHostStateImpl<T, S>(
             )
         }
         cachedSnapshotBackstack = currentBackstack
-        cachedSnapshot = snapshot
+        cachedSnapshot = java.lang.ref.WeakReference(snapshot)
         return snapshot
     }
 
