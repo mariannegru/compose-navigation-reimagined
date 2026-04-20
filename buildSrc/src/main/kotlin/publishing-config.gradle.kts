@@ -23,6 +23,13 @@ afterEvaluate {
     publishing {
         publications {
             create<MavenPublication>(createPublicationName()) {
+                // Publish under the JitPack-style coordinate so `publishToMavenLocal`
+                // produces the exact same groupId:artifactId:version consumers get
+                // from `com.github.mariannegru.compose-navigation-reimagined:<module>:<tag>`.
+                // project.group is intentionally left alone — it drives the Android
+                // `namespace` and must match the Kotlin package root.
+                groupId = "com.github.mariannegru.compose-navigation-reimagined"
+
                 from(components["release"])
 
                 pom {

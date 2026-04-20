@@ -10,6 +10,7 @@ import androidx.compose.animation.core.updateTransition
 import androidx.compose.animation.togetherWith
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -341,25 +342,48 @@ fun <T, S> ScopingAnimatedNavHost(
     state = state,
     transitionQueueing = transitionQueueing
 ) { targetSnapshot ->
+    // Key AnimatedContent on the last entry id (a tiny opaque NavId) rather than
+    // the full NavSnapshot. AnimatedContent retains its transition-state keys in
+    // an internal scatter map (AnimatedContentTransitionScopeImpl.targetSizeMap);
+    // using NavSnapshot as S caused that map to pin a full NavHostEntry graph per
+    // navigation forever. With NavId as S the map still grows, but only by ~20 B
+    // per unique destination.
+    val targetKey = targetSnapshot.items.lastOrNull()?.hostEntry?.id
+
+    // Look-up table so the transitionSpec and content lambda can still get the
+    // full NavSnapshot for a given key. Kept as a plain remembered map (no
+    // MutableStateMap) — writes don't need to invalidate readers, we only read
+    // values that we've just written in the same recomposition.
+    val snapshotsByKey = remember { HashMap<NavId?, NavSnapshot<T, S>>() }
+    snapshotsByKey[targetKey] = targetSnapshot
+
     val transition = updateTransition(
-        targetState = targetSnapshot,
+        targetState = targetKey,
         label = "AnimatedNavHost"
     )
+
     transition.AnimatedContent(
         modifier = modifier,
         transitionSpec = {
-            selectTransition(transitionSpec, targetState.action)
+            val initialEntry = snapshotsByKey[initialState]?.items?.lastOrNull()?.hostEntry
+            val targetEntry = snapshotsByKey[targetState]?.items?.lastOrNull()?.hostEntry
+            val action = snapshotsByKey[targetState]?.action ?: NavAction.Idle
+            selectTransition(transitionSpec, action, initialEntry, targetEntry)
         },
-        contentKey = { it.items.lastOrNull()?.hostEntry?.id },
         contentAlignment = contentAlignment
-    ) { snapshot ->
-        val lastSnapshotItem = snapshot.items.lastOrNull()
+    ) { key ->
+        // Capture the snapshot for this content instance at first composition.
+        // The captured reference lives only as long as this content is retained
+        // by AnimatedContent; when the exit animation finishes and the content
+        // is disposed, the capture is released along with it.
+        val capturedSnapshot = remember { snapshotsByKey[key] }
+        val lastSnapshotItem = capturedSnapshot?.items?.lastOrNull()
         if (lastSnapshotItem != null) {
             lastSnapshotItem.ComponentsProvider {
                 val animatedVisibilityScope = this@AnimatedContent
-                val scope = remember(snapshot, animatedVisibilityScope) {
+                val scope = remember(capturedSnapshot, animatedVisibilityScope) {
                     ScopingAnimatedNavHostScopeImpl(
-                        hostEntries = snapshot.items.map { it.hostEntry },
+                        hostEntries = capturedSnapshot.items.map { it.hostEntry },
                         scopedHostEntries = lastSnapshotItem.scopedHostEntries,
                         animatedVisibilityScope = animatedVisibilityScope
                     )
@@ -370,16 +394,25 @@ fun <T, S> ScopingAnimatedNavHost(
             emptyBackstackPlaceholder()
         }
     }
-    return@BaseNavHost transition.currentState
+
+    // Once the transition has settled, drop entries for keys that are no longer
+    // showing. Runs after a successful composition, so the exit animations for
+    // those keys have already completed and their content has been disposed.
+    SideEffect {
+        if (transition.currentState == transition.targetState) {
+            snapshotsByKey.keys.retainAll(setOf(targetKey))
+        }
+    }
+
+    return@BaseNavHost snapshotsByKey[transition.currentState] ?: targetSnapshot
 }
 
-private fun <T, S> AnimatedContentTransitionScope<NavSnapshot<T, S>>.selectTransition(
+private fun <T> AnimatedContentTransitionScope<NavId?>.selectTransition(
     transitionSpec: NavTransitionSpec<T>,
     action: NavAction,
+    initialStateLastEntry: NavHostEntry<T>?,
+    targetStateLastEntry: NavHostEntry<T>?,
 ): ContentTransform {
-    val initialStateLastEntry = initialState.items.lastOrNull()?.hostEntry
-    val targetStateLastEntry = targetState.items.lastOrNull()?.hostEntry
-
     // Request transition spec only when anything actually changes and should be animated.
     // For some reason AnimatedContent calls for transitionSpec even when created initially
     // which doesn't make much sense.

@@ -246,6 +246,26 @@ internal class NavHostStateImpl<T, S>(
         cachedSnapshot?.get()?.let { existing ->
             if (cachedSnapshotBackstack === currentBackstack) return existing
         }
+
+        // Opportunistic drain: any queued item whose outdated entries are all absent
+        // from the current backstack is safe to reclaim now, even if no transition
+        // ever triggered BaseNavHost's cleanup effects. Bounds queue growth under
+        // rapid navigation or non-settling visibleItems.
+        if (outdatedHostEntriesQueue.isNotEmpty()) {
+            val currentBackstackIds = currentBackstack.entries.mapTo(hashSetOf()) { it.id }
+            val iterator = outdatedHostEntriesQueue.iterator()
+            while (iterator.hasNext()) {
+                val item = iterator.next()
+                if (item.outdatedHostEntries.all { it.id !in currentBackstackIds }) {
+                    iterator.remove()
+                    item.outdatedHostEntries.forEach { entry ->
+                        entry.maxLifecycleState = Lifecycle.State.DESTROYED
+                        removeComponents(entry.id)
+                    }
+                }
+            }
+        }
+
         val snapshot = NavSnapshot(
             items = currentBackstack.entries.map { entry ->
                 NavSnapshotItem(
@@ -281,7 +301,7 @@ internal class NavHostStateImpl<T, S>(
             )
         }
         cachedSnapshotBackstack = currentBackstack
-        cachedSnapshot = java.lang.ref.WeakReference(snapshot)
+        cachedSnapshot = WeakReference(snapshot)
         return snapshot
     }
 
@@ -342,9 +362,38 @@ internal class NavHostStateImpl<T, S>(
 
     fun onDispose() {
         hostLifecycle.removeObserver(lifecycleEventObserver)
-        getAllHostEntries().forEach {
-            it.hostLifecycleState = Lifecycle.State.DESTROYED
+
+        // Queued outdated entries are never needed again — drain unconditionally.
+        outdatedHostEntriesQueue.forEach { item ->
+            item.outdatedHostEntries.forEach { entry ->
+                entry.maxLifecycleState = Lifecycle.State.DESTROYED
+                removeComponents(entry.id)
+            }
         }
+        outdatedHostEntriesQueue.clear()
+
+        if (hostLifecycle.currentState == Lifecycle.State.DESTROYED) {
+            // Activity/Fragment is being destroyed (config change or process death).
+            // Leave SavedStateProvider and ViewModelStore registrations in place so
+            // a restored NavHostStateImpl can reuse them via initComponents().
+            getAllHostEntries().forEach {
+                it.hostLifecycleState = Lifecycle.State.DESTROYED
+            }
+        } else {
+            // NavHost was removed from composition while its owner is still alive.
+            // Unregister everything so we don't pin entries in the owner's
+            // SavedStateRegistry / NavHostViewModel for the rest of its lifetime.
+            (hostEntriesMap.values.toList() + scopedHostEntriesMap.values.toList())
+                .forEach { entry ->
+                    entry.hostLifecycleState = Lifecycle.State.DESTROYED
+                    removeComponents(entry.id)
+                }
+            hostEntriesMap.clear()
+            scopedHostEntriesMap.clear()
+        }
+
+        cachedSnapshotBackstack = null
+        cachedSnapshot = null
     }
 
     fun onTransitionStart(visibleItems: Set<NavSnapshotItem<T, S>>) {
